@@ -6,13 +6,13 @@ const wss = new WebSocket.Server({ server });
 
 const clients = new Set();
 const recentFinds = [];
-const activeAccounts = new Map(); // playerName → { jobId, lastUpdate }
+const activeAccounts = new Map(); // playerName → { jobId, lastUpdate, ws }
 
-// Alte Einträge alle 20 Sekunden aufräumen
+// Alte Einträge aufräumen
 setInterval(() => {
   const now = Date.now();
   for (const [player, data] of activeAccounts) {
-    if (now - data.lastUpdate > 90000) { // 90 Sekunden Timeout
+    if (now - data.lastUpdate > 90000) {
       activeAccounts.delete(player);
     }
   }
@@ -24,6 +24,14 @@ function getOccupiedJobIds() {
     if (data.jobId) ids.add(data.jobId);
   }
   return Array.from(ids);
+}
+
+function getAccountsOnJobId(jobId) {
+  const list = [];
+  for (const [player, data] of activeAccounts) {
+    if (data.jobId === jobId) list.push(player);
+  }
+  return list;
 }
 
 function broadcastOccupied() {
@@ -41,11 +49,42 @@ function broadcastOccupied() {
   });
 }
 
+// Prüft ob mehrere Accounts auf demselben Server sind und schickt Force-Hop
+function checkDuplicates() {
+  const jobIdCount = new Map();
+
+  for (const [player, data] of activeAccounts) {
+    if (!data.jobId) continue;
+    if (!jobIdCount.has(data.jobId)) jobIdCount.set(data.jobId, []);
+    jobIdCount.get(data.jobId).push(player);
+  }
+
+  for (const [jobId, players] of jobIdCount) {
+    if (players.length >= 2) {
+      // Sortiere alphabetisch → der "kleinere" Name muss hoppen
+      players.sort();
+      const mustHop = players[0]; // der erste in der Liste hoppt
+
+      console.log(`[DUPLICATE] JobId ${jobId} hat ${players.length} Accounts → ${mustHop} muss hoppen`);
+
+      // Sende Force-Hop nur an den betroffenen Account
+      for (const [player, data] of activeAccounts) {
+        if (player === mustHop && data.ws && data.ws.readyState === WebSocket.OPEN) {
+          data.ws.send(JSON.stringify({
+            type: "force_hop",
+            reason: "duplicate_account",
+            jobId: jobId
+          }));
+        }
+      }
+    }
+  }
+}
+
 wss.on("connection", (ws) => {
   clients.add(ws);
   console.log(`[+] Client verbunden | Online: ${clients.size}`);
 
-  // Sofort die aktuelle Liste schicken
   ws.send(JSON.stringify({
     type: "occupied_servers",
     jobIds: getOccupiedJobIds(),
@@ -59,17 +98,18 @@ wss.on("connection", (ws) => {
       if (data.type === "join") {
         activeAccounts.set(data.player, {
           jobId: data.jobId,
-          lastUpdate: Date.now()
+          lastUpdate: Date.now(),
+          ws: ws
         });
-        console.log(`Join: ${data.player} | JobId: ${data.jobId} | Aktive Accounts: ${activeAccounts.size}`);
-        broadcastOccupied(); // Alle sofort updaten
+        console.log(`Join: ${data.player} | JobId: ${data.jobId} | Aktive: ${activeAccounts.size}`);
+        broadcastOccupied();
+        checkDuplicates(); // ← hier wird geprüft
       }
 
       if (data.type === "best_brainrot") {
         const entry = {
           name: data.name,
           value: data.value || 0,
-          priority: data.priority || false,
           jobId: data.jobId,
           player: data.player,
           time: Date.now()
@@ -91,16 +131,22 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     clients.delete(ws);
+    // Optional: Account entfernen wenn Verbindung weg ist
+    for (const [player, data] of activeAccounts) {
+      if (data.ws === ws) {
+        activeAccounts.delete(player);
+        break;
+      }
+    }
     console.log(`[-] Client getrennt | Online: ${clients.size}`);
   });
 });
 
-// Alle 12 Sekunden Hop-Signal + aktuelle Occupied-Liste
+// Alle 12 Sekunden Hop-Signal + Occupied
 setInterval(() => {
   if (clients.size === 0) return;
 
   const occupied = getOccupiedJobIds();
-
   const msg = JSON.stringify({
     type: "smart_hop",
     occupied: occupied,
@@ -112,6 +158,9 @@ setInterval(() => {
       client.send(msg);
     }
   });
+
+  // Auch hier nochmal auf Duplikate prüfen
+  checkDuplicates();
 
   console.log(`[HOP] Signal an ${clients.size} Clients | Occupied: ${occupied.length}`);
 }, 12000);
